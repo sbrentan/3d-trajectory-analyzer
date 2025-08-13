@@ -1,24 +1,39 @@
 import json
 import numpy as np
 import matplotlib.pyplot as plt
+from dataclasses import dataclass
 
-def load_points(data_path):
-    """Load 3D points from annotations, skipping nulls."""
+@dataclass
+class Point3D:
+    id: int
+    x: float
+    y: float
+    z: float
+
+@dataclass
+class Trajectory:
+    id: int
+    points: list[Point3D]
+
+def load_points(path: str, key: str = "3d_point") -> list[Point3D]:
+    """
+    Load 3D points from a JSON annotations file.
+
+    Returns list of 3D points skipping null / invalid entries.
+    """
     
-    with open(data_path, "r") as f:
+    with open(path, "r") as f:
         data = json.load(f)
 
-    if "annotations" not in data:
-        return []
-    
-    pts = []
-    for idx, ann in enumerate(data["annotations"]):
-        p = ann.get("3d_point", None)
+    pts: list[Point3D] = []
+    anns = data.get("annotations", [])
+    for idx, ann in enumerate(anns):
+        p = ann.get(key, None)
         if p is not None:
-            pts.append((idx, np.array(p, dtype=float)))
+            pts.append(Point3D(id=idx, x=float(p[0]), y=float(p[1]), z=float(p[2])))
     return pts
 
-def detect_trajectories(points, min_length=3, threshold=0.001):
+def detect_trajectories(points, min_length=3, threshold=0.001) -> list[Trajectory]:
     """
     Detect trajectories by:
     1. Splitting at obstacles in X and Y
@@ -27,9 +42,9 @@ def detect_trajectories(points, min_length=3, threshold=0.001):
     if not points:
         return []
 
-    xs = [p[1][0] for p in points]
-    ys = [p[1][1] for p in points]
-    zs = [p[1][2] for p in points]
+    xs = [p.x for p in points]
+    ys = [p.y for p in points]
+    zs = [p.z for p in points]
 
     # X and Y boundaries (walls)
     min_x = min(xs) + threshold
@@ -54,20 +69,20 @@ def detect_trajectories(points, min_length=3, threshold=0.001):
     break_indices.append(len(points) - 1)  # include last point
 
     # Build trajectories
-    trajectories = []
+    trajectories: list[Trajectory] = []
     for start, end in zip(break_indices, break_indices[1:]):
         if end - start >= min_length:
-            trajectories.append((start, end))
+            trajectories.append(Trajectory(id=len(trajectories), points=points[start:end+1]))
 
     return trajectories
 
-def plot_trajectories(points, trajectories, plot_points=False, plot_markers=False):
+def plot_trajectories(trajectories, plot_points=False, plot_markers=False):
     fig = plt.figure(figsize=(12, 8))
     ax = fig.add_subplot(111, projection='3d')
 
     # Plot all points faintly for context
     if plot_points:
-        all_pts = np.array([p for _, p in points if p is not None])
+        all_pts = np.array([[p.x, p.y, p.z] for traj in trajectories for p in traj.points])
         ax.scatter(all_pts[:, 0], all_pts[:, 1], all_pts[:, 2],
                    s=5, alpha=0.15, color="gray", label="All points")
 
@@ -86,12 +101,12 @@ def plot_trajectories(points, trajectories, plot_points=False, plot_markers=Fals
     ]
 
     # Plot each trajectory with cycling colors
-    for t_id, (start, end) in enumerate(trajectories):
-        color = base_colors[t_id % len(base_colors)]
-        traj_pts = np.array([points[i][1] for i in range(start, end + 1) if points[i][1] is not None])
+    for traj_id, traj in enumerate(trajectories):
+        color = base_colors[traj_id % len(base_colors)]
+        traj_pts = np.array([[p.x, p.y, p.z] for p in traj.points])
 
         ax.plot(traj_pts[:, 0], traj_pts[:, 1], traj_pts[:, 2],
-                color=color, linewidth=2, alpha=0.9, label=f"Traj {t_id}")
+                color=color, linewidth=2, alpha=0.9, label=f"Traj {traj_id}")
 
         # Start & End markers
         if plot_markers:
@@ -99,7 +114,7 @@ def plot_trajectories(points, trajectories, plot_points=False, plot_markers=Fals
             ax.scatter(traj_pts[-1, 0], traj_pts[-1, 1], traj_pts[-1, 2], c="red", s=60, marker="x")
 
         # Add trajectory ID
-        ax.text(traj_pts[0, 0], traj_pts[0, 1], traj_pts[0, 2] + 0.2, str(t_id),
+        ax.text(traj_pts[0, 0], traj_pts[0, 1], traj_pts[0, 2] + 0.2, str(traj_id),
                 color=color, fontsize=9, weight="bold")
 
     ax.set_xlabel("X")
@@ -112,5 +127,6 @@ def plot_trajectories(points, trajectories, plot_points=False, plot_markers=Fals
 if __name__ == "__main__":
     points = load_points("3d_points.json")
     trajectories = detect_trajectories(points)
-    print("Detected trajectories (start_idx, end_idx):", trajectories)
-    plot_trajectories(points, trajectories, plot_points=False, plot_markers=False)
+    for traj in trajectories:
+        print(f"Trajectory {traj.id}: ({points.index(traj.points[0])}, {points.index(traj.points[-1])})")
+    plot_trajectories(trajectories, plot_points=True, plot_markers=True)
