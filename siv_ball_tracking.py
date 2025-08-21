@@ -11,6 +11,8 @@ from google.colab import drive
 drive.mount('/content/drive')
 file_path = '/content/drive/MyDrive/3d_points.json'
 
+!pip install plotly
+!pip install ipywidgets
 
 import json
 from dataclasses import dataclass
@@ -262,17 +264,19 @@ if __name__ == "__main__":
         print("Error: '3d_points.json' not found.")
         print("Please upload the file to your Google Colab session.")
 
-!pip install ipywidgets
-
 import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
 
 # --- Imports for interactivity ---
-from ipywidgets import interactive, Dropdown
+from ipywidgets import interactive, Dropdown, interactive_output, VBox, Label, HTML
+from IPython.display import display
 
 # Set the default renderer for Google Colab
 pio.renderers.default = "colab"
+
+from google.colab import output
+output.enable_custom_widget_manager()
 
 
 # --- Replaced prediction function with a curve-fitting version ---
@@ -341,90 +345,118 @@ def predict_trajectory_from_fit(trajectory: Trajectory):
     return smoothed_original, predicted_path, z_coeffs
 
 
+def get_fit_statistics(raw_points: np.ndarray, fitted_points: np.ndarray, z_coeffs: tuple):
+    """
+    Calculates and prints statistics about the deviation between raw
+    and fitted trajectory points.
+    """
+    # Calculate the Euclidean distance for each point
+    # The result is an array of distances, one for each point.
+    distances = np.linalg.norm(raw_points - fitted_points, axis=1)
+
+    # Calculate summary statistics
+    mean_dist = np.mean(distances)
+    max_dist = np.max(distances)
+    std_dev = np.std(distances)
+    rmse = np.sqrt(np.mean(distances**2)) # Root Mean Square Error
+
+    equation_str = ""
+    if z_coeffs is not None:
+        a, b, c = z_coeffs
+        equation_str = f"z(n) = {a:.4f}n²"
+        equation_str += f" + {b:.4f}n" if b >= 0 else f" - {-b:.4f}n"
+        equation_str += f" + {c:.4f}" if c >= 0 else f" - {-c:.4f}"
+
+    # Build the HTML string using <pre> for fixed-width font and spacing
+    html_string = f"""
+    <pre>
+==========================================================
+<b>      Statistical Analysis: GT vs. Fitted Trajectory</b>
+==========================================================
+Total Points Analyzed: {len(distances)}
+
+Deviation from the fitted curve (in meters):
+  - Trajectory Parabola Equation:   {equation_str}
+  - Average Distance (Mean Error):  {mean_dist:.4f} m
+  - Maximum Distance (Peak Error):  {max_dist:.4f} m
+  - Standard Deviation of Error:    {std_dev:.4f} m
+  - Root Mean Square Error (RMSE):  {rmse:.4f} m
+==========================================================
+    </pre>
+    """
+    return html_string
+
+
 def create_interactive_predictor(trajectories):
     """
-    Creates an interactive Plotly plot with a dropdown and button to predict trajectories.
+    Creates an interactive Plotly plot with a dropdown to predict trajectories.
     """
+    # 1. Create the widgets
     traj_dropdown = Dropdown(
         options=[(f"Trajectory {traj.id}", traj.id) for traj in trajectories],
         description='Select Trajectory:',
-        value=0
+        value=trajectories[0].id if trajectories else None
     )
 
-    def plot_prediction(trajectory_selection):
-        fig = go.Figure()
-        selected_id = traj_dropdown.value
+    traj_statistics = HTML()
+
+    # Create an output widget to hold the plot
+    output = go.FigureWidget() # Use FigureWidget for smoother updates
+
+    # This function will run every time the dropdown value changes.
+    def update_plot(change):
+        selected_id = change['new'] # The new value from the dropdown
         selected_traj = next((t for t in trajectories if t.id == selected_id), None)
-        if not selected_traj: return
-
-        # Use the new fitting function to get the paths
-        smoothed_original, predicted_path, z_coeffs = predict_trajectory_from_fit(selected_traj)
-
-        if z_coeffs is not None:
-            a, b, c = z_coeffs
-            equation_str = f"z(n) = {a:.4f}n²"
-            equation_str += f" + {b:.4f}n" if b >= 0 else f" - {-b:.4f}n"
-            equation_str += f" + {c:.4f}" if c >= 0 else f" - {-c:.4f}"
-
-            print("-" * 40)
-            print(f"Trajectory {traj.id} Parabola Equation:")
-            print(equation_str)
-            print("-" * 40)
-
-        fig.data = [] # Clear previous plot data
-
-        if smoothed_original is None:
-            fig.update_layout(title=f"Could not fit Trajectory {selected_id} (not enough points)")
+        if not selected_traj:
             return
 
-        # Plot the original noisy data points for comparison
+        smoothed_original, predicted_path, z_coeffs = predict_trajectory_from_fit(selected_traj)
+
         raw_pts = np.array([[p.x, p.y, p.z] for p in selected_traj.points])
-        fig.add_trace(go.Scatter3d(
-            x=raw_pts[:, 0], y=raw_pts[:, 1], z=raw_pts[:, 2],
-            mode='markers',
-            marker=dict(color='grey', size=3, opacity=0.6),
-            name='Observed Points'
-        ))
+        if smoothed_original is not None:
+             traj_statistics.value = get_fit_statistics(raw_pts, smoothed_original, z_coeffs)
 
-        # Plot the smoothed, fitted trajectory line
-        fig.add_trace(go.Scatter3d(
-            x=smoothed_original[:, 0], y=smoothed_original[:, 1], z=smoothed_original[:, 2],
-            mode='lines',
-            line=dict(color='blue', width=6),
-            name='Fitted Trajectory'
-        ))
+        # --- Update the plot using batch_update for efficiency ---
+        with output.batch_update():
+            output.data = [] # Clear previous traces
 
-        # Plot the predicted path if it exists
-        if predicted_path is not None:
-            fig.add_trace(go.Scatter3d(
-                x=predicted_path[:, 0], y=predicted_path[:, 1], z=predicted_path[:, 2],
-                mode='lines',
-                line=dict(color='red', width=6, dash='dash'),
-                name='Predicted Path'
-            ))
-            fig.add_trace(go.Scatter3d(
-                x=[predicted_path[-1, 0]], y=[predicted_path[-1, 1]], z=[predicted_path[-1, 2]],
-                mode='markers',
-                marker=dict(color='darkred', size=8, symbol='x'),
-                name='Predicted Impact'
-            ))
+            if smoothed_original is None:
+                output.layout.title = f"Could not fit Trajectory {selected_id} (not enough points)"
+                return
 
-        add_field_meshes(fig)
+            # Add traces for the new trajectory
+            output.add_trace(go.Scatter3d(x=raw_pts[:,0], y=raw_pts[:,1], z=raw_pts[:,2], mode='markers', marker=dict(color='grey', size=3, opacity=0.6), name='Observed Points'))
+            output.add_trace(go.Scatter3d(x=smoothed_original[:,0], y=smoothed_original[:,1], z=smoothed_original[:,2], mode='lines', line=dict(color='blue', width=6), name='Fitted Trajectory'))
+            if predicted_path is not None:
+                output.add_trace(go.Scatter3d(x=predicted_path[:,0], y=predicted_path[:,1], z=predicted_path[:,2], mode='lines', line=dict(color='red', width=6, dash='dash'), name='Predicted Path'))
+                output.add_trace(go.Scatter3d(x=[predicted_path[-1,0]], y=[predicted_path[-1,1]], z=[predicted_path[-1,2]], mode='markers', marker=dict(color='darkred', size=8, symbol='x'), name='Predicted Impact'))
 
-        fig.update_layout(
-            title=f"Trajectory {selected_id} with Fitted Prediction",
-            scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z"),
-            legend=dict(x=0.8, y=0.9), width=1200, height=800, autosize=False,
-            scene_yaxis_range=[-6, 15],
-            scene_xaxis_range=[-6, 24],
-            scene_zaxis_range=[0, 6],
-            scene_aspectmode='manual',
-            scene_aspectratio=dict(x=2.1, y=1.3, z=0.6)
-        )
-        fig.show()
+            add_field_meshes(output)
 
-    interactive_plot = interactive(plot_prediction, trajectory_selection=traj_dropdown)
-    display(interactive_plot)
+            # Update layout
+            output.layout.width = 1200
+            output.layout.height = 800
+            output.layout.title = f"Trajectory {selected_id} with Fitted Prediction"
+            output.layout.scene = dict(
+                xaxis_title="X", yaxis_title="Y", zaxis_title="Z",
+                yaxis_range=[-6, 15], xaxis_range=[-6, 24], zaxis_range=[0, 6],
+                aspectmode='manual', aspectratio=dict(x=2.1, y=1.3, z=0.6)
+            )
+
+    # Link the dropdown to the update function
+    # The .observe() method says "when the 'value' changes, run update_plot"
+    traj_dropdown.observe(update_plot, names='value')
+
+    # Display the UI (dropdown, statistics and initial plot)
+    # VBox stacks the widgets vertically
+    display(VBox([traj_dropdown, traj_statistics, output]))
+
+    # Wait a small amount of time for the widget to correctly render
+    import time
+    time.sleep(0.1)
+
+    # Trigger the first plot draw manually
+    update_plot({'new': traj_dropdown.value})
 
 
 if __name__ == "__main__":
