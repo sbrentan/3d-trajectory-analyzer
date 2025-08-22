@@ -32,29 +32,66 @@ def load_points(path: str, key: str = "3d_point") -> List[Point3D]:
             pts.append(Point3D(id=idx, x=float(p[0]), y=float(p[1]), z=float(p[2])))
     return pts
 
-def derivative(arr: np.ndarray) -> np.ndarray:
+def compute_angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
     """
-    Compute the first derivative d(arr)/dt (assuming uniform sampling).
-    """
-    return np.gradient(arr)
-
-def angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
-    """
-    Return angle in radians between 1D arrays v1 and v2.
+    Return angle between two velocity vectors.
     """
     n1 = np.linalg.norm(v1)
     n2 = np.linalg.norm(v2)
-    if n1 < 1e-10 or n2 < 1e-10: 
-        return 0.0
-    cosv = np.dot(v1, v2) / (n1 * n2)
-    cosv = np.clip(cosv, -1.0, 1.0)
-    return np.arccos(cosv)
+    
+    if n1 < 1e-6 or n2 < 1e-6: 
+        return 0
+    
+    cos_angle = np.dot(v1, v2) / (n1 * n2)
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return np.arccos(cos_angle)
+
+def compute_derivatives(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
+    """
+    Compute velocity and acceleration given positions.
+    """
+
+    vx = np.gradient(xs, axis=0)
+    vy = np.gradient(ys, axis=0)
+    vz = np.gradient(zs, axis=0)
+
+    velocities = np.column_stack([vx, vy, vz])
+    speeds = np.linalg.norm(velocities, axis=1)
+
+    ax = np.gradient(vx, axis=0)
+    ay = np.gradient(vy, axis=0)
+    az = np.gradient(vz, axis=0)
+
+    accelerations = np.column_stack([ax, ay, az])
+    acc_magnitudes = np.linalg.norm(accelerations, axis=1)
+
+    return velocities, speeds, accelerations, acc_magnitudes
+
+def compute_curvatures(v: np.ndarray, a: np.ndarray) -> float:
+    """
+    Compute curvature given velocity and acceleration vectors.
+    """
+    cross = np.cross(v, a)
+    num = np.linalg.norm(cross, axis=1)
+    denom = (np.linalg.norm(v, axis=1) ** 3) + 1e-12
+    return num / denom
+
+def compute_threshold(arr: np.ndarray, k: float) -> float:
+    """
+    Compute a threshold value from the given array.
+    """
+    med = np.median(arr)
+    mad = np.median(np.abs(arr - med)) + 1e-12
+    return med + k * mad
 
 def detect_trajectories(
     points: List[Point3D],
-    min_length: int = 3,                    # minimum trajectory length (number of points)
-    vz_thresh: float = 0.05,                # vertical velocity magnitude for sign change (m/s)
-    angle_thresh: float = np.pi / 6,        # angle change threshold (radians)
+    angle_thresh: float = np.pi / 4,        # angle change threshold (radians)
+    k_dist: float = 4.0,                    # Distance threshold
+    k_acc: float = 3.0,                     # Acceleration threshold
+    k_curv: float = 1.0,                    # Curvature threshold
+    spike_ratio: float = 3.0,               # Spike ratio for position discontinuities
+    min_evidences: int = 3,                 # Minimum evidences to consider a break
     verbose: bool = False
 ) -> List[Trajectory]:
     """
@@ -62,97 +99,114 @@ def detect_trajectories(
 
     Returns list of Trajectory objects.
     """
+
     if not points:
-        return []
+        raise ValueError("No points provided.")
 
     n = len(points)
-    if n < min_length:
-        return [Trajectory(id=0, points=points)]
+    if n < 3: # 3 is minimum number of points
+        raise ValueError("Insufficient points to detect trajectories.")
+    
+    np_points = np.array([(p.x, p.y, p.z) for p in points])
 
     # Prepare arrays
-    xs = np.array([p.x for p in points], dtype=float)
-    ys = np.array([p.y for p in points], dtype=float)
-    zs = np.array([p.z for p in points], dtype=float)
+    xs = np_points[:, 0]
+    ys = np_points[:, 1]
+    zs = np_points[:, 2]
 
-    # Prepare max/min values
-    max_x = max(xs) - 1e-6
-    max_y = max(ys) - 1e-6
-    min_x = min(xs) + 1e-6
-    min_y = min(ys) + 1e-6
+    # Motion variables
+    velocities, speeds, accelerations, acc_magnitudes = compute_derivatives(xs, ys, zs)
+    curvatures = compute_curvatures(velocities, accelerations)
+    distances = np.linalg.norm(np.diff(np_points, axis=0), axis=1)
+    med_speed = np.median(speeds)
 
-    # Velocities
-    vx = derivative(xs)  # Derivative of x values (i.e. horizontal velocity)
-    vy = derivative(ys)  # Derivative of y values (i.e. horizontal velocity)
-    vz = derivative(zs)  # Derivative of z values (i.e. vertical velocity)
+    # Thresholds
+    thr_dist = compute_threshold(distances, k_dist)
+    thr_acc = compute_threshold(acc_magnitudes, k_acc)
+    thr_curv = compute_threshold(curvatures, k_curv)
 
-    # Combine horizontal velocities into a 2D vector
-    vxy = np.vstack((vx, vy)).T
+    # Tolerances
+    min_speed_tolerance = 0.6
+    speed_tolerance = 1e-3
+    eps = 1e-12
 
     # candidate break indices
     candidate_breaks = []
 
-    for i in range(1, n-1):
+    for i in range(1, n - 2):
         reasons = []
 
-        # Check 1: Local minima condition
-        is_local_min = zs[i] < zs[i-1] and zs[i] < zs[i+1]
+        # Evidence 1: local minima
+        is_local_min = (zs[i] < zs[i-1] - eps) and (zs[i] < zs[i+1] - eps)
 
-        # Check 2: Max/Min values condition
-        is_max = xs[i] > max_x or ys[i] > max_y
-        is_min = xs[i] < min_x or ys[i] < min_y
+        # Evidence 2: local speed minima
+        is_speed_min = (speeds[i] < speeds[i-1] - eps) and (speeds[i] < speeds[i+1] - eps) and (speeds[i] < min_speed_tolerance * med_speed)
 
-        # Check 3: ensure vertical velocity change (down -> up)
-        window = max(1, min(2, i, n-2-i))  # ensure at least 1 to avoid empty slices
-        vz_before = np.mean(vz[max(0, i-window):i])
-        vz_after = np.mean(vz[i+1:min(n, i+1+window)])
-        vz_sign_change = (vz_before < -vz_thresh) and (vz_after > vz_thresh)
+        # Evidence 3: local acceleration maxima
+        is_high_accel = acc_magnitudes[i] > acc_magnitudes[i-1] and acc_magnitudes[i] > acc_magnitudes[i+1] and acc_magnitudes[i] > thr_acc
 
-        # Check 4: ensure angle variation between vertical velocity vectors
-        v_before_z = np.array([0.0, 0.0, vz_before])
-        v_after_z = np.array([0.0, 0.0, vz_after])
-        vert_angle = angle_between(v_before_z, v_after_z)
-        vert_angle_significant = vert_angle > angle_thresh
+        # Evidence 4: direction change (angle between velocity vectors)
+        theta = compute_angle_between(velocities[i-1], velocities[i])
+        is_angle_change = theta > angle_thresh
 
-        # Check 5: ensure angle variation between horizontal velocity vectors
-        horiz_angle = angle_between(vxy[i-1], vxy[i+1])
-        horiz_angle_significant = horiz_angle > angle_thresh
+        # Evidence 5: local position discontinuites (sudden jumps respect the adjacent values)
+        if (i - 1) < len(distances):
+            d = distances[i-1]
+            prev_distance = distances[i-2] if (i-2) >= 0 else d
+            next_distance = distances[i] if (i) < len(distances) else d
+            local_spike = (d > prev_distance * spike_ratio) and (d > next_distance * spike_ratio)
+            global_outlier = d > thr_dist
+        is_pos_discont = local_spike or global_outlier
+
+        # Evidence 6: drop of speed near to zero
+        is_speed_zero = speeds[i] < speed_tolerance * med_speed
+
+        # Evidence 7: high curvature
+        is_high_curvature = curvatures[i] > thr_curv    
 
         # Collect evidence
         evidence_count = 0
-        if is_max or is_min:
+        if is_local_min:
+            evidence_count += 2  # Quite strong evidence (but not always true)
+            reasons.append("local_minimum")
+        if is_speed_min:
             evidence_count += 1
-            reasons.append("max_min_condition")
-        if vz_sign_change:
+            reasons.append("local_speed_minimum")
+        if is_high_accel:
             evidence_count += 1
-            reasons.append("vz_sign_change")
-        if vert_angle_significant:
+            reasons.append("high_acceleration")
+        if is_angle_change:
             evidence_count += 1
-            reasons.append("vert_angle_jump")
-        if horiz_angle_significant:
+            reasons.append("direction_change")
+        if is_pos_discont:
             evidence_count += 1
-            reasons.append("horiz_angle_jump")
+            reasons.append("position_discontinuity")
+        if is_high_curvature:
+            evidence_count += 1
+            reasons.append("high_curvature")
+        if is_speed_zero:
+            evidence_count += 1
+            reasons.append("speed_zero")
 
         # Decision logic
-        if is_local_min and evidence_count >= 1:
-            reasons.insert(0, "local_minimum+weak_evidence")
-            candidate_breaks.append((i, reasons))
-        elif (is_max or is_min) and evidence_count >= 2:
-            reasons.insert(0, "max_min_condition+medium_evidence")
-            candidate_breaks.append((i, reasons))
-        elif evidence_count >= 3:
-            reasons.insert(0, "strong_evidence")
-            candidate_breaks.append((i, reasons))
+        if evidence_count >= min_evidences:
+            last_candidate = candidate_breaks[-1][0] if candidate_breaks else None
+            if last_candidate and (i - last_candidate) < 5:
+                new_index = (i + last_candidate) // 2
+                candidate_breaks[-1] = (new_index, reasons)
+            else:
+                candidate_breaks.append((i, reasons))
 
     if not candidate_breaks:
-        break_indices = [0, n-1] # Single trajectory
+        break_indices = {0, n - 1}
     else:
-        break_indices = [0] + [c[0] for c in candidate_breaks] + [n-1]
-        break_indices = sorted(list(set(break_indices)))
+        break_indices = {0} | {c[0] for c in candidate_breaks} | {n - 1}
+        break_indices = sorted(break_indices)
 
     # Build trajectories from segments
     trajectories: List[Trajectory] = []
     for start, end in zip(break_indices, break_indices[1:]):
-        if end - start + 1 >= min_length:
+        if end - start + 1 >= 3:
             trajectories.append(Trajectory(id=len(trajectories), points=points[start:end+1]))
 
     if verbose:
@@ -216,7 +270,7 @@ if __name__ == "__main__":
     pts = load_points("3d_points.json")
     trajectories = detect_trajectories(pts, verbose=True)
     for traj in trajectories:
-        start_idx = pts.index(traj.points[0])
-        end_idx = pts.index(traj.points[-1])
+        start_idx = traj.points[0].id
+        end_idx = traj.points[-1].id
         print(f"Trajectory {traj.id}: ({start_idx}, {end_idx})")
     plot_trajectories(trajectories, plot_points=True, plot_markers=True)
