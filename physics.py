@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import List
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
 
 @dataclass
 class Point3D:
@@ -32,17 +33,17 @@ def load_points(path: str, key: str = "3d_point") -> List[Point3D]:
             pts.append(Point3D(id=idx, x=float(p[0]), y=float(p[1]), z=float(p[2])))
     return pts
 
-def compute_angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
+def compute_angle_between(vel1: np.ndarray, vel2: np.ndarray) -> float:
     """
     Return angle between two velocity vectors.
     """
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
+    n1 = np.linalg.norm(vel1)
+    n2 = np.linalg.norm(vel2)
     
     if n1 < 1e-6 or n2 < 1e-6: 
         return 0
-    
-    cos_angle = np.dot(v1, v2) / (n1 * n2)
+
+    cos_angle = np.dot(vel1, vel2) / (n1 * n2)
     cos_angle = np.clip(cos_angle, -1.0, 1.0)
     return np.arccos(cos_angle)
 
@@ -67,13 +68,13 @@ def compute_derivatives(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> (np.n
 
     return velocities, speeds, accelerations, acc_magnitudes
 
-def compute_curvatures(v: np.ndarray, a: np.ndarray) -> float:
+def compute_curvatures(velocities: np.ndarray, accelerations: np.ndarray) -> float:
     """
     Compute curvature given velocity and acceleration vectors.
     """
-    cross = np.cross(v, a)
+    cross = np.cross(velocities, accelerations)
     num = np.linalg.norm(cross, axis=1)
-    denom = (np.linalg.norm(v, axis=1) ** 3) + 1e-12
+    denom = (np.linalg.norm(velocities, axis=1) ** 3) + 1e-12
     return num / denom
 
 def compute_threshold(arr: np.ndarray, k: float) -> float:
@@ -86,17 +87,19 @@ def compute_threshold(arr: np.ndarray, k: float) -> float:
 
 def detect_trajectories(
     points: List[Point3D],
-    angle_thresh: float = np.pi / 4,        # angle change threshold (radians)
+    min_length: int = 3,                    # Minimum trajectory length
+    zs_smoothing_window: int = 5,           # Smoothing window size
+    zs_poly_order: int = 2,                 # Polynomial order for Savitzky-Golay filter
+    angle_thresh: float = np.pi / 4,        # Angle change threshold
     k_dist: float = 4.0,                    # Distance threshold
     k_acc: float = 3.0,                     # Acceleration threshold
-    k_curv: float = 1.0,                    # Curvature threshold
+    k_curv: float = 1.5,                    # Curvature threshold
     spike_ratio: float = 3.0,               # Spike ratio for position discontinuities
     min_evidences: int = 3,                 # Minimum evidences to consider a break
     verbose: bool = False
 ) -> List[Trajectory]:
     """
-    Detect trajectories using physics-informed, rule-based heuristics.
-
+    Detect trajectories from a list of 3D points using physics-based heuristics.
     Returns list of Trajectory objects.
     """
 
@@ -104,7 +107,7 @@ def detect_trajectories(
         raise ValueError("No points provided.")
 
     n = len(points)
-    if n < 3: # 3 is minimum number of points
+    if n < min_length: 
         raise ValueError("Insufficient points to detect trajectories.")
     
     np_points = np.array([(p.x, p.y, p.z) for p in points])
@@ -113,6 +116,9 @@ def detect_trajectories(
     xs = np_points[:, 0]
     ys = np_points[:, 1]
     zs = np_points[:, 2]
+
+    # Smoothing filter on Z-axis to remove local-maxima noise where possible
+    zs = savgol_filter(zs, zs_smoothing_window, zs_poly_order)
 
     # Motion variables
     velocities, speeds, accelerations, acc_magnitudes = compute_derivatives(xs, ys, zs)
@@ -126,8 +132,7 @@ def detect_trajectories(
     thr_curv = compute_threshold(curvatures, k_curv)
 
     # Tolerances
-    min_speed_tolerance = 0.6
-    speed_tolerance = 1e-3
+    speed_tolerance = 0.6
     eps = 1e-12
 
     # candidate break indices
@@ -140,7 +145,7 @@ def detect_trajectories(
         is_local_min = (zs[i] < zs[i-1] - eps) and (zs[i] < zs[i+1] - eps)
 
         # Evidence 2: local speed minima
-        is_speed_min = (speeds[i] < speeds[i-1] - eps) and (speeds[i] < speeds[i+1] - eps) and (speeds[i] < min_speed_tolerance * med_speed)
+        is_speed_min = (speeds[i] < speeds[i-1] - eps) and (speeds[i] < speeds[i+1] - eps) and (speeds[i] < speed_tolerance * med_speed)
 
         # Evidence 3: local acceleration maxima
         is_high_accel = acc_magnitudes[i] > acc_magnitudes[i-1] and acc_magnitudes[i] > acc_magnitudes[i+1] and acc_magnitudes[i] > thr_acc
@@ -158,16 +163,13 @@ def detect_trajectories(
             global_outlier = d > thr_dist
         is_pos_discont = local_spike or global_outlier
 
-        # Evidence 6: drop of speed near to zero
-        is_speed_zero = speeds[i] < speed_tolerance * med_speed
-
-        # Evidence 7: high curvature
+        # Evidence 6: high curvature
         is_high_curvature = curvatures[i] > thr_curv    
 
         # Collect evidence
         evidence_count = 0
         if is_local_min:
-            evidence_count += 2  # Quite strong evidence (but not always true)
+            evidence_count += min_evidences - 1 # Quite strong evidence
             reasons.append("local_minimum")
         if is_speed_min:
             evidence_count += 1
@@ -184,16 +186,13 @@ def detect_trajectories(
         if is_high_curvature:
             evidence_count += 1
             reasons.append("high_curvature")
-        if is_speed_zero:
-            evidence_count += 1
-            reasons.append("speed_zero")
 
         # Decision logic
         if evidence_count >= min_evidences:
             last_candidate = candidate_breaks[-1][0] if candidate_breaks else None
-            if last_candidate and (i - last_candidate) < 5:
-                new_index = (i + last_candidate) // 2
-                candidate_breaks[-1] = (new_index, reasons)
+            if last_candidate:
+                if (i - last_candidate) >= min_length:
+                    candidate_breaks.append((i, reasons))
             else:
                 candidate_breaks.append((i, reasons))
 
@@ -206,8 +205,7 @@ def detect_trajectories(
     # Build trajectories from segments
     trajectories: List[Trajectory] = []
     for start, end in zip(break_indices, break_indices[1:]):
-        if end - start + 1 >= 3:
-            trajectories.append(Trajectory(id=len(trajectories), points=points[start:end+1]))
+        trajectories.append(Trajectory(id=len(trajectories), points=points[start:end+1]))
 
     if verbose:
         # print candidate details
@@ -225,8 +223,7 @@ def plot_trajectories(trajectories: List[Trajectory], plot_points: bool = False,
     if plot_points:
         all_pts = np.array([[p.x, p.y, p.z] for traj in trajectories for p in traj.points])
         if all_pts.size > 0:
-            ax.scatter(all_pts[:, 0], all_pts[:, 1], all_pts[:, 2],
-                       s=5, alpha=0.15, color="gray", label="All points")
+            ax.scatter(all_pts[:, 0], all_pts[:, 1], all_pts[:, 2], s=5, alpha=0.15, color="gray", label="All points")
 
     # Predefined 10 bright colors
     base_colors = [
@@ -256,8 +253,7 @@ def plot_trajectories(trajectories: List[Trajectory], plot_points: bool = False,
             ax.scatter(traj_pts[-1, 0], traj_pts[-1, 1], traj_pts[-1, 2], c="red", s=60, marker="x")
 
         # Add trajectory ID
-        ax.text(traj_pts[0, 0], traj_pts[0, 1], traj_pts[0, 2] + 0.2, str(traj_id),
-                color=color, fontsize=9, weight="bold")
+        ax.text(traj_pts[0, 0], traj_pts[0, 1], traj_pts[0, 2] + 0.2, str(traj_id), color=color, fontsize=9, weight="bold")
 
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
