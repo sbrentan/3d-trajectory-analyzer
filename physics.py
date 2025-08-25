@@ -208,10 +208,14 @@ def detect_trajectories(
         trajectories.append(Trajectory(id=len(trajectories), points=points[start:end+1]))
 
     if verbose:
-        # print candidate details
-        print("Candidate break points (index: reasons):")
-        for idx, reasons in candidate_breaks:
-            print(f"  {idx}: {reasons}")
+        for traj in trajectories:
+            start = traj.points[0].id
+            end = traj.points[-1].id
+            print(f'Trajectory {traj.id}:')
+            start_reasons = next((reasons for (idx, reasons) in candidate_breaks if idx == start), ["start point"])
+            end_reasons = next((reasons for (idx, reasons) in candidate_breaks if idx == end), ["end point"])
+            print(f"  - {start}: {start_reasons}")
+            print(f"  - {end}: {end_reasons}")
 
     return trajectories
 
@@ -265,8 +269,4 @@ def plot_trajectories(trajectories: List[Trajectory], plot_points: bool = False,
 if __name__ == "__main__":
     pts = load_points("3d_points.json")
     trajectories = detect_trajectories(pts, verbose=True)
-    for traj in trajectories:
-        start_idx = traj.points[0].id
-        end_idx = traj.points[-1].id
-        print(f"Trajectory {traj.id}: ({start_idx}, {end_idx})")
     plot_trajectories(trajectories, plot_points=True, plot_markers=True)
