@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
@@ -47,7 +47,7 @@ def compute_angle_between(vel1: np.ndarray, vel2: np.ndarray) -> float:
     cos_angle = np.clip(cos_angle, -1.0, 1.0)
     return np.arccos(cos_angle)
 
-def compute_derivatives(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
+def compute_derivatives(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute velocity and acceleration given positions.
     """
