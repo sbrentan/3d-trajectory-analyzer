@@ -12,25 +12,29 @@ class Point3D:
     y: float
     z: float
 
+
 @dataclass
 class Trajectory:
     id: int
-    points: List[Point3D]
+    points: list[Point3D]
 
-def load_points(path: str, key: str = "3d_point") -> List[Point3D]:
+
+def load_points(path: str, key: str = "3d_point") -> list[Point3D]:
     """
     Load 3D points from a JSON annotations file.
+
     Returns list of 3D points skipping null / invalid entries.
     """
+
     with open(path, "r") as f:
         data = json.load(f)
 
-    pts: List[Point3D] = []
-    anns = data.get("annotations", [])
-    for idx, ann in enumerate(anns):
+    pts: list[Point3D] = []
+    annotations = data.get("annotations", [])
+    for ann in annotations:
         p = ann.get(key, None)
         if p is not None:
-            pts.append(Point3D(id=idx, x=float(p[0]), y=float(p[1]), z=float(p[2])))
+            pts.append(Point3D(id=len(pts), x=float(p[0]), y=float(p[1]), z=float(p[2])))
     return pts
 
 def compute_angle_between(vel1: np.ndarray, vel2: np.ndarray) -> float:
@@ -39,8 +43,8 @@ def compute_angle_between(vel1: np.ndarray, vel2: np.ndarray) -> float:
     """
     n1 = np.linalg.norm(vel1)
     n2 = np.linalg.norm(vel2)
-    
-    if n1 < 1e-6 or n2 < 1e-6: 
+
+    if n1 < 1e-6 or n2 < 1e-6:
         return 0
 
     cos_angle = np.dot(vel1, vel2) / (n1 * n2)
@@ -68,7 +72,7 @@ def compute_derivatives(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> Tuple
 
     return velocities, speeds, accelerations, acc_magnitudes
 
-def compute_curvatures(velocities: np.ndarray, accelerations: np.ndarray) -> float:
+def compute_curvatures(velocities: np.ndarray, accelerations: np.ndarray) -> np.ndarray:
     """
     Compute curvature given velocity and acceleration vectors.
     """
@@ -87,19 +91,21 @@ def compute_threshold(arr: np.ndarray, k: float) -> float:
 
 def detect_trajectories(
     points: List[Point3D],
-    min_length: int = 3,                    # Minimum trajectory length
-    zs_smoothing_window: int = 5,           # Smoothing window size
-    zs_poly_order: int = 2,                 # Polynomial order for Savitzky-Golay filter
-    angle_thresh: float = np.pi / 4,        # Angle change threshold
-    k_dist: float = 4.0,                    # Distance threshold
-    k_acc: float = 3.0,                     # Acceleration threshold
-    k_curv: float = 1.5,                    # Curvature threshold
-    spike_ratio: float = 3.0,               # Spike ratio for position discontinuities
-    min_evidences: int = 3,                 # Minimum evidences to consider a break
-    verbose: bool = False
+    min_length: int = 3,                          # Minimum trajectory length
+    zs_smoothing_window: int = 5,                 # Smoothing window size
+    zs_poly_order: int = 2,                       # Polynomial order for Savitzky-Golay filter
+    thr_angle: float = np.pi / 4,                 # Directional change threshold
+    k_dist: float = 4.0,                          # Distance threshold
+    k_acc: float = 3.0,                           # Acceleration threshold
+    k_curv: float = 1.5,                          # Curvature threshold
+    k_speed: float = 0.5,                         # Speed threshold
+    spike_ratio: float = 3.0,                     # Spike ratio for position discontinuities
+    min_evidences: int = 3,                       # Minimum evidences to consider a break
+    filter_meaningful_trajectories: bool = True,  # Filter only meaningful trajectories
+    verbose: bool = False,
 ) -> List[Trajectory]:
     """
-    Detect trajectories from a list of 3D points using physics-based heuristics.
+    Detect trajectories from a list of 3D points using physics-based and geometry-based heuristics.
     Returns list of Trajectory objects.
     """
 
@@ -107,9 +113,10 @@ def detect_trajectories(
         raise ValueError("No points provided.")
 
     n = len(points)
-    if n < min_length: 
+    if n < min_length:
         raise ValueError("Insufficient points to detect trajectories.")
-    
+
+    # Store the points also in Numpy format for later calculations
     np_points = np.array([(p.x, p.y, p.z) for p in points])
 
     # Prepare arrays
@@ -117,42 +124,44 @@ def detect_trajectories(
     ys = np_points[:, 1]
     zs = np_points[:, 2]
 
-    # Smoothing filter on Z-axis to remove local-maxima noise where possible
-    zs = savgol_filter(zs, zs_smoothing_window, zs_poly_order)
+    # Geometric variables
+    distances = np.linalg.norm(np.diff(np_points, axis=0), axis=1) # Pair-wise Euclidean distances
+    zs = savgol_filter(zs, zs_smoothing_window, zs_poly_order) # Smoothing filter on Z-axis
 
     # Motion variables
     velocities, speeds, accelerations, acc_magnitudes = compute_derivatives(xs, ys, zs)
     curvatures = compute_curvatures(velocities, accelerations)
-    distances = np.linalg.norm(np.diff(np_points, axis=0), axis=1)
     med_speed = np.median(speeds)
 
     # Thresholds
     thr_dist = compute_threshold(distances, k_dist)
     thr_acc = compute_threshold(acc_magnitudes, k_acc)
     thr_curv = compute_threshold(curvatures, k_curv)
+    thr_speed = compute_threshold(speeds, k_speed)
 
     # Tolerances
-    speed_tolerance = 0.6
     eps = 1e-12
 
-    # candidate break indices
-    candidate_breaks = []
+    # candidate break points alongside with reasons
+    candidate_breaks: List[Tuple[int, List[str]]] = []
 
+    # Start and end are excluded as they are for sure break points
     for i in range(1, n - 2):
+        # reasons array to store all the motivations for a point to be picked
         reasons = []
 
         # Evidence 1: local minima
         is_local_min = (zs[i] < zs[i-1] - eps) and (zs[i] < zs[i+1] - eps)
 
         # Evidence 2: local speed minima
-        is_speed_min = (speeds[i] < speeds[i-1] - eps) and (speeds[i] < speeds[i+1] - eps) and (speeds[i] < speed_tolerance * med_speed)
+        is_speed_min = (speeds[i] < speeds[i-1] - eps) and (speeds[i] < speeds[i+1] - eps) and (speeds[i] < thr_speed)
 
         # Evidence 3: local acceleration maxima
-        is_high_accel = acc_magnitudes[i] > acc_magnitudes[i-1] and acc_magnitudes[i] > acc_magnitudes[i+1] and acc_magnitudes[i] > thr_acc
+        is_high_accel = (acc_magnitudes[i] > acc_magnitudes[i-1]) and (acc_magnitudes[i] > acc_magnitudes[i+1]) and (acc_magnitudes[i] > thr_acc)
 
         # Evidence 4: direction change (angle between velocity vectors)
         theta = compute_angle_between(velocities[i-1], velocities[i])
-        is_angle_change = theta > angle_thresh
+        is_angle_change = theta > thr_angle
 
         # Evidence 5: local position discontinuites (sudden jumps respect the adjacent values)
         if (i - 1) < len(distances):
@@ -164,12 +173,12 @@ def detect_trajectories(
         is_pos_discont = local_spike or global_outlier
 
         # Evidence 6: high curvature
-        is_high_curvature = curvatures[i] > thr_curv    
+        is_high_curvature = curvatures[i] > thr_curv
 
         # Collect evidence
         evidence_count = 0
         if is_local_min:
-            evidence_count += min_evidences - 1 # Quite strong evidence
+            evidence_count += min_evidences - 1 # Quite strong evidence, so higher weight
             reasons.append("local_minimum")
         if is_speed_min:
             evidence_count += 1
@@ -197,9 +206,9 @@ def detect_trajectories(
                 candidate_breaks.append((i, reasons))
 
     if not candidate_breaks:
-        break_indices = {0, n - 1}
+        break_indices = {0, n - 1} # Single trajectory scenario
     else:
-        break_indices = {0} | {c[0] for c in candidate_breaks} | {n - 1}
+        break_indices = {0} | {c[0] for c in candidate_breaks} | {n - 1} # Multiple trajectories scenario
         break_indices = sorted(break_indices)
 
     # Build trajectories from segments
@@ -207,6 +216,24 @@ def detect_trajectories(
     for start, end in zip(break_indices, break_indices[1:]):
         trajectories.append(Trajectory(id=len(trajectories), points=points[start:end+1]))
 
+    # Filter out trajectories meaningless trajectories
+    # (Usually the first dribbles before the ball serve)
+    if filter_meaningful_trajectories:
+        for idx, traj in enumerate(trajectories):
+            is_inside_field = False
+            if traj.points[0].x >= 0 and traj.points[0].x <= 18:
+                if traj.points[0].y >= 0 and traj.points[0].y <= 9:
+                    is_inside_field = True
+            if not is_inside_field:
+                if traj.points[-1].x >= 0 and traj.points[-1].x <= 18:
+                    if traj.points[-1].y >= 0 and traj.points[-1].y <= 9:
+                        is_inside_field = True
+            if is_inside_field:
+                trajectories = trajectories[idx:]
+                break
+        for idx, traj in enumerate(trajectories):
+            traj.id = idx
+    
     if verbose:
         for traj in trajectories:
             start = traj.points[0].id
@@ -267,6 +294,12 @@ def plot_trajectories(trajectories: List[Trajectory], plot_points: bool = False,
     plt.show()
 
 if __name__ == "__main__":
-    pts = load_points("3d_points.json")
-    trajectories = detect_trajectories(pts, verbose=True)
-    plot_trajectories(trajectories, plot_points=True, plot_markers=True)
+
+    import glob
+
+    for i in range(10):
+        file = glob.glob(f"C:/Users/Matteo/Downloads/3D-prime10/3D/5/3d_points.json")
+        pts = load_points(file[0]) if file else []
+        trajectories = detect_trajectories(pts, verbose=True)
+        plot_trajectories(trajectories, plot_points=True, plot_markers=True)
+        break
