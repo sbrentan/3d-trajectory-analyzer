@@ -161,10 +161,7 @@ def detect_trajectories(
 
         # Evidence 4: direction change (angle between velocity vectors)
         theta = compute_angle_between(velocities[i-1], velocities[i])
-        angle_threshold = thr_angle
-        if zs[i] > np.percentile(zs, 75):  # In upper 25% of heights
-            angle_threshold = thr_angle * 1.5  # Require sharper turns
-        is_angle_change = theta > angle_threshold
+        is_angle_change = theta > thr_angle * 1.5 if zs[i] > np.percentile(zs, 75) else theta > thr_angle
 
         # Evidence 5: local position discontinuites (sudden jumps respect the adjacent values)
         d = distances[i-1]
