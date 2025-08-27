@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
+from scipy.ndimage import gaussian_filter1d
 
 @dataclass
 class Point3D:
@@ -91,17 +91,16 @@ def compute_threshold(arr: np.ndarray, k: float) -> float:
 
 def detect_trajectories(
     points: List[Point3D],
-    min_length: int = 3,                          # Minimum trajectory length
-    zs_smoothing_window: int = 5,                 # Smoothing window size
-    zs_poly_order: int = 2,                       # Polynomial order for Savitzky-Golay filter
-    thr_angle: float = np.pi / 4,                 # Directional change threshold
-    k_dist: float = 4.0,                          # Distance threshold
-    k_acc: float = 3.0,                           # Acceleration threshold
-    k_curv: float = 1.5,                          # Curvature threshold
-    k_speed: float = 0.5,                         # Speed threshold
-    spike_ratio: float = 3.0,                     # Spike ratio for position discontinuities
-    min_evidences: int = 3,                       # Minimum evidences to consider a break
-    filter_meaningful_trajectories: bool = True,  # Filter only meaningful trajectories
+    min_length: int = 3,                           # Minimum trajectory length
+    sigma: float = 0.5,                            # Gaussian smoothing sigma
+    thr_angle: float = np.pi / 6,                  # Directional change threshold
+    k_dist: float = 3.0,                           # Distance threshold
+    k_acc: float = 4.0,                            # Acceleration threshold
+    k_curv: float = 2.5,                           # Curvature threshold
+    speed_tolerance: float = 0.4,                  # Speed tolerance for minimum speed detection
+    spike_ratio: float = 1.5,                      # Spike ratio for position discontinuities
+    min_evidences: int = 3,                        # Minimum evidences to consider a break
+    filter_meaningful_trajectories: bool = True,   # Filter only meaningful trajectories
     verbose: bool = False,
 ) -> List[Trajectory]:
     """
@@ -126,18 +125,19 @@ def detect_trajectories(
 
     # Geometric variables
     distances = np.linalg.norm(np.diff(np_points, axis=0), axis=1) # Pair-wise Euclidean distances
-    zs = savgol_filter(zs, zs_smoothing_window, zs_poly_order) # Smoothing filter on Z-axis
+    xs = gaussian_filter1d(xs, sigma=sigma, mode="nearest") # Apply 
+    ys = gaussian_filter1d(ys, sigma=sigma, mode="nearest")
+    zs = gaussian_filter1d(zs, sigma=sigma, mode="nearest")
 
     # Motion variables
     velocities, speeds, accelerations, acc_magnitudes = compute_derivatives(xs, ys, zs)
-    curvatures = compute_curvatures(velocities, accelerations)
     med_speed = np.median(speeds)
+    curvatures = compute_curvatures(velocities, accelerations)
 
     # Thresholds
     thr_dist = compute_threshold(distances, k_dist)
     thr_acc = compute_threshold(acc_magnitudes, k_acc)
     thr_curv = compute_threshold(curvatures, k_curv)
-    thr_speed = compute_threshold(speeds, k_speed)
 
     # Tolerances
     eps = 1e-12
@@ -154,22 +154,24 @@ def detect_trajectories(
         is_local_min = (zs[i] < zs[i-1] - eps) and (zs[i] < zs[i+1] - eps)
 
         # Evidence 2: local speed minima
-        is_speed_min = (speeds[i] < speeds[i-1] - eps) and (speeds[i] < speeds[i+1] - eps) and (speeds[i] < thr_speed)
+        is_speed_min = (speeds[i] < speeds[i-1] - eps) and (speeds[i] < speeds[i+1] - eps) and (speeds[i] < speed_tolerance * med_speed)
 
         # Evidence 3: local acceleration maxima
         is_high_accel = (acc_magnitudes[i] > acc_magnitudes[i-1]) and (acc_magnitudes[i] > acc_magnitudes[i+1]) and (acc_magnitudes[i] > thr_acc)
 
         # Evidence 4: direction change (angle between velocity vectors)
         theta = compute_angle_between(velocities[i-1], velocities[i])
-        is_angle_change = theta > thr_angle
+        angle_threshold = thr_angle
+        if zs[i] > np.percentile(zs, 75):  # In upper 25% of heights
+            angle_threshold = thr_angle * 1.5  # Require sharper turns
+        is_angle_change = theta > angle_threshold
 
         # Evidence 5: local position discontinuites (sudden jumps respect the adjacent values)
-        if (i - 1) < len(distances):
-            d = distances[i-1]
-            prev_distance = distances[i-2] if (i-2) >= 0 else d
-            next_distance = distances[i] if (i) < len(distances) else d
-            local_spike = (d > prev_distance * spike_ratio) and (d > next_distance * spike_ratio)
-            global_outlier = d > thr_dist
+        d = distances[i-1]
+        prev_distance = distances[i-2] if (i-2) >= 0 else d
+        next_distance = distances[i] if (i) < len(distances) else d
+        local_spike = (d > prev_distance * spike_ratio) and (d > next_distance * spike_ratio)
+        global_outlier = d > thr_dist
         is_pos_discont = local_spike or global_outlier
 
         # Evidence 6: high curvature
@@ -233,7 +235,7 @@ def detect_trajectories(
                 break
         for idx, traj in enumerate(trajectories):
             traj.id = idx
-    
+
     if verbose:
         for traj in trajectories:
             start = traj.points[0].id
@@ -298,8 +300,7 @@ if __name__ == "__main__":
     import glob
 
     for i in range(10):
-        file = glob.glob(f"C:/Users/Matteo/Downloads/3D-prime10/3D/5/3d_points.json")
+        file = glob.glob(f"C:/Users/Matteo/Downloads/3D-prime10/3D/{i+1}/3d_points.json")
         pts = load_points(file[0]) if file else []
         trajectories = detect_trajectories(pts, verbose=True)
         plot_trajectories(trajectories, plot_points=True, plot_markers=True)
-        break
